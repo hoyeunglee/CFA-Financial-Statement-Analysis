@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>EDGAR Financial Statement Viewer + CFA Valuation</title>
+  <script src="./xlsx.full.min.js"></script>
+  <style>
+    body { font-family: Arial; padding: 20px; }
+    input, button { padding: 8px; margin: 5px; }
+    table { border-collapse: collapse; margin-top: 20px; width: 100%; }
+    th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
+    th { background: #f0f0f0; }
+    .section-title { margin-top: 40px; font-weight: bold; }
+    pre, #valuationOutput { background: #f9f9f9; padding: 10px; border: 1px solid #ccc; white-space: pre-wrap; }
+
+    #statementItemList {
+      max-height: 400px;
+      overflow-y: auto;
+      font-family: monospace;
+    }
+  </style>
+</head>
+<body>
+
+  <h2>EDGAR Financial Statement Viewer + CFA Valuation, npm proxy/server.js</h2>
+
+  <input type="text" id="ticker" placeholder="Enter stock ticker (e.g., AAPL)" />
+  <button onclick="fetchFinancials()">Fetch Financials</button>
+  <button onclick="downloadCSV()">Export CSV</button>
+  <button onclick="calculateRatios()">Evaluate Basic Ratios</button>
+  <button onclick="calculateDetailedRatios()">Calculate Detailed Ratios</button>
+  <button onclick="performEquityValuation()">Equity Valuation (Simple DDM)</button>
+  <button onclick="runAdvancedValuation()">Run Advanced CFA Valuation</button>
+  <button onclick="showCompanyDetails()">Show Company Details</button>
+  <button onclick="showLatestDividend()">Show Latest Dividend Info</button>
+  <button onclick="showAllStatementItems()">Show All Statement Items</button>
+  <button onclick="showStandardXBRLItems()">Show Standard XBRL Items</button>
+
+  <div id="status"></div>
+
+  <div class="section-title">Balance Sheet</div>
+  <table id="balanceSheetTable"></table>
+
+  <div class="section-title">Profit & Loss Statement</div>
+  <table id="plTable"></table>
+
+  <div class="section-title">Financial Ratios</div>
+  <table id="ratiosTable"></table>
+
+  <div class="section-title">Equity Valuation (CFA Style)</div>
+  <pre id="valuationOutput"></pre>
+
+  <div class="section-title">Company Details</div>
+  <pre id="companyDetails"></pre>
+
+  <div class="section-title">Latest Dividend Info</div>
+  <pre id="dividendInfo"></pre>
+
+<script>
+  let balanceData = [];
+  let plData = [];
+  let ratioData = [];
+  let currentCIK = "";
+  let submissionsData = null;
+
+  // Store collected financial data for valuation
+  let financialsForValuation = {};
+
+  async function fetchCIK(ticker) {
+    const res = await fetch('/api/tickers');
+    const json = await res.json();
+    for (const key in json) {
+      if (json[key].ticker.toUpperCase() === ticker.toUpperCase()) {
+        return json[key].cik_str.toString().padStart(10, '0');
+      }
+    }
+    throw new Error("CIK not found");
+  }
+
+  async function fetchSubmissions(cik) {
+    const url = `/api/submissions/${cik}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("Failed to fetch submissions JSON");
+    return await res.json();
+  }
+
+  async function fetchLatestFilingCIK(cik) {
+    if (!submissionsData) submissionsData = await fetchSubmissions(cik);
+    for (let i = 0; i < submissionsData.filings.recent.form.length; i++) {
+      const form = submissionsData.filings.recent.form[i];
+      if (form === '10-K' || form === '10-Q') {
+        return {
+          accessionNumber: submissionsData.filings.recent.accessionNumber[i],
+          reportDate: submissionsData.filings.recent.reportDate[i]
+        };
+      }
+    }
+    throw new Error("No recent 10-K/10-Q filing");
+  }
+
+  async function fetchXBRL(cik, tag) {
+    const url = `/api/concept/${cik}/${tag}`;
+    const res = await fetch(url);
+    if (!res.ok) return { val: 0, end: '' };
+    const data = await res.json();
+    return data.units?.USD?.slice(-1)[0] || { val: 0, end: '' };
+  }
+
+  async function fetchFinancials() {
+    const ticker = document.getElementById("ticker").value.trim().toUpperCase();
+    if (!ticker) {
+      alert("Please enter a ticker symbol");
+      return;
+    }
+    document.getElementById("status").textContent = "Fetching financial data...";
+    balanceData = []; plData = []; ratioData = [];
+    submissionsData = null;
+    currentCIK = "";
+    financialsForValuation = {};
+
+    try {
+      currentCIK = await fetchCIK(ticker);
+      submissionsData = await fetchSubmissions(currentCIK);
+      const filing = await fetchLatestFilingCIK(currentCIK);
+
+      // Fetch required XBRL items:
+      const [
+        assets,
+        currentAssets,
+        liabilities,
+        currentLiabilities,
+        totalEquity,
+        accountsPayable,
+        accountsReceivable,
+        accumulatedOCI,
+        cashAndEquivalents,
+        costOfGoodsSold,
+        debtCurrent,
+        debtLongTerm,
+        depreciationAmortization,
+        epsBasic,
+        ebit,
+        ebitda,
+        grossMargin,
+        grossProfit,
+        incomeBeforeTax,
+        interestExpense,
+        inventory,
+        netCashFromOps,
+        netCashUsedInvesting,
+        netIncomeLoss,
+        operatingExpenses,
+        operatingIncome,
+        operatingMargin,
+        ppeNet,
+        retainedEarnings,
+        revenue,
+        returnOnAssets,
+        returnOnEquity,
+        totalAssets,
+        totalCurrentAssets,
+        totalCurrentLiabilities,
+        totalLiabilities,
+        totalLiabilitiesAndEquity,
+        treasuryStock,
+        sharesOutstandingData
+      ] = await Promise.all([
+        fetchXBRL(currentCIK, "Assets"),
+        fetchXBRL(currentCIK, "AssetsCurrent"),
+        fetchXBRL(currentCIK, "Liabilities"),
+        fetchXBRL(currentCIK, "LiabilitiesCurrent"),
+        fetchXBRL(currentCIK, "StockholdersEquity"),
+        fetchXBRL(currentCIK, "AccountsPayable"),
+        fetchXBRL(currentCIK, "AccountsReceivable"),
+        fetchXBRL(currentCIK, "AccumulatedOtherComprehensiveIncomeLoss"),
+        fetchXBRL(currentCIK, "CashAndCashEquivalents"),
+        fetchXBRL(currentCIK, "CostOfGoodsSold"),
+        fetchXBRL(currentCIK, "DebtCurrent"),
+        fetchXBRL(currentCIK, "LongTermDebtNoncurrent"),
+        fetchXBRL(currentCIK, "DepreciationAndAmortization"),
+        fetchXBRL(currentCIK, "EarningsPerShareBasic"),
+        fetchXBRL(currentCIK, "Ebit"),
+        fetchXBRL(currentCIK, "Ebitda"),
+        fetchXBRL(currentCIK, "GrossMargin"),
+        fetchXBRL(currentCIK, "GrossProfit"),
+        fetchXBRL(currentCIK, "IncomeBeforeTax"),
+        fetchXBRL(currentCIK, "InterestExpense"),
+        fetchXBRL(currentCIK, "Inventory"),
+        fetchXBRL(currentCIK, "NetCashProvidedByOperatingActivities"),
+        fetchXBRL(currentCIK, "NetCashUsedForInvestingActivities"),
+        fetchXBRL(currentCIK, "NetIncomeLoss"),
+        fetchXBRL(currentCIK, "OperatingExpenses"),
+        fetchXBRL(currentCIK, "OperatingIncome"),
+        fetchXBRL(currentCIK, "OperatingMargin"),
+        fetchXBRL(currentCIK, "PropertyPlantAndEquipmentNet"),
+        fetchXBRL(currentCIK, "RetainedEarnings"),
+        fetchXBRL(currentCIK, "Revenues"),
+        fetchXBRL(currentCIK, "ReturnOnAssets"),
+        fetchXBRL(currentCIK, "ReturnOnEquity"),
+        fetchXBRL(currentCIK, "TotalAssets"),
+        fetchXBRL(currentCIK, "TotalCurrentAssets"),
+        fetchXBRL(currentCIK, "TotalCurrentLiabilities"),
+        fetchXBRL(currentCIK, "TotalLiabilities"),
+        fetchXBRL(currentCIK, "TotalLiabilitiesAndEquity"),
+        fetchXBRL(currentCIK, "TreasuryStock"),
+        fetchXBRL(currentCIK, "CommonStockSharesOutstanding")
+      ]);
+
+      balanceData = [
+        ["Label", "Date", "Value (USD)"],
+        ["Total Assets", assets.end, assets.val],
+        ["Current Assets", currentAssets.end, currentAssets.val],
+        ["Total Liabilities", liabilities.end, liabilities.val],
+        ["Current Liabilities", currentLiabilities.end, currentLiabilities.val],
+        ["Total Equity", totalEquity.end, totalEquity.val],
+        ["Accounts Payable", accountsPayable.end, accountsPayable.val],
+        ["Accounts Receivable", accountsReceivable.end, accountsReceivable.val],
+        ["Accumulated OCI", accumulatedOCI.end, accumulatedOCI.val],
+        ["Cash & Cash Equivalents", cashAndEquivalents.end, cashAndEquivalents.val],
+        ["Inventory", inventory.end, inventory.val],
+        ["Property, Plant & Equipment", ppeNet.end, ppeNet.val],
+        ["Short Term Debt", debtCurrent.end, debtCurrent.val],
+        ["Long Term Debt", debtLongTerm.end, debtLongTerm.val],
+        ["Treasury Stock", treasuryStock.end, treasuryStock.val]
+      ];
+
+      plData = [
+        ["Label", "Date", "Value (USD)"],
+        ["Revenue", revenue.end, revenue.val],
+        ["Cost of Goods Sold", costOfGoodsSold.end, costOfGoodsSold.val],
+        ["Gross Profit", grossProfit.end, grossProfit.val],
+        ["Gross Margin", grossMargin.end, grossMargin.val],
+        ["Operating Income", operatingIncome.end, operatingIncome.val],
+        ["Operating Margin", operatingMargin.end, operatingMargin.val],
+        ["EBIT", ebit.end, ebit.val],
+        ["EBITDA", ebitda.end, ebitda.val],
+        ["Interest Expense", interestExpense.end, interestExpense.val],
+        ["Operating Expenses", operatingExpenses.end, operatingExpenses.val],
+        ["Income Before Tax", incomeBeforeTax.end, incomeBeforeTax.val],
+        ["Net Income", netIncomeLoss.end, netIncomeLoss.val],
+        ["Depreciation & Amortization", depreciationAmortization.end, depreciationAmortization.val],
+        ["EPS Basic", epsBasic.end, epsBasic.val],
+        ["Return on Assets", returnOnAssets.end, returnOnAssets.val],
+        ["Return on Equity", returnOnEquity.end, returnOnEquity.val],
+        ["Net Cash Provided By Operating Activities", netCashFromOps.end, netCashFromOps.val],
+        ["Net Cash Used For Investing Activities", netCashUsedInvesting.end, netCashUsedInvesting.val],
+        ["Retained Earnings", retainedEarnings.end, retainedEarnings.val]
+      ];
+
+      renderTable("balanceSheetTable", balanceData);
+      renderTable("plTable", plData);
+      document.getElementById("status").textContent = `Data for ${ticker} as of ${assets.end}`;
+
+      // Store key financials for valuation prompts later
+      financialsForValuation = {
+        dividends: parseFloat(prompt("Enter last annual dividend per share (e.g., 0.12):", "0.12")) || 0,
+        growthRate: parseFloat(prompt("Enter expected dividend growth rate (e.g. 0.05):", "0.05")) || 0.05,
+        wacc: parseFloat(prompt("Enter WACC (weighted average cost of capital):", "0.08")) || 0.08,
+        fcf: parseFloat(prompt("Enter Free Cash Flow to Firm (FCF):", "0")) || 0,
+        totalDebt: (debtLongTerm.val || 0) + (debtCurrent.val || 0),
+        netIncome: netIncomeLoss.val || 0,
+        bookValue: totalEquity.val || 0,
+        roe: totalEquity.val ? (netIncomeLoss.val / totalEquity.val) : 0,
+        sharesOutstanding: sharesOutstandingData.val || 0,
+        peRatio: 0 // You can add fetch market cap logic here later if needed
+      };
+
+      // Clear previous outputs
+      document.getElementById("companyDetails").textContent = "";
+      document.getElementById("dividendInfo").textContent = "";
+      document.getElementById("ratiosTable").innerHTML = "";
+      document.getElementById("valuationOutput").textContent = "";
+
+    } catch (e) {
+      document.getElementById("status").textContent = "Error: " + e.message;
+      console.error(e);
+    }
+  }
+
+  function renderTable(elementId, data) {
+    const table = document.getElementById(elementId);
+    if (!data.length) {
+      table.innerHTML = "<tr><td>No data</td></tr>";
+      return;
+    }
+    let html = "<tr>";
+    for (let i = 0; i < data[0].length; i++) {
+      html += `<th>${data[0][i]}</th>`;
+    }
+    html += "</tr>";
+    for (let i = 1; i < data.length; i++) {
+      html += "<tr>";
+      for (let j = 0; j < data[i].length; j++) {
+        html += `<td>${formatNumberIfNeeded(data[i][j])}</td>`;
+      }
+      html += "</tr>";
+    }
+    table.innerHTML = html;
+  }
+
+  function formatNumberIfNeeded(val) {
+    if (typeof val === 'number') return val.toLocaleString();
+    if (!isNaN(parseFloat(val)) && isFinite(val)) return parseFloat(val).toLocaleString();
+    return val;
+  }
+
+  function calculateRatios() {
+    if (!balanceData.length || !plData.length) {
+      alert("Fetch financials first.");
+      return;
+    }
+
+    const totalAssets = getVal("Total Assets", balanceData);
+    const totalLiabilities = getVal("Total Liabilities", balanceData);
+    const totalEquity = getVal("Total Equity", balanceData);
+    const netIncome = getVal("Net Income", plData);
+    const revenue = getVal("Revenue", plData);
+    const currentAssets = getVal("Current Assets", balanceData);
+    const currentLiabilities = getVal("Current Liabilities", balanceData);
+
+    if (!totalAssets || !totalEquity || !revenue) {
+      alert("Incomplete data for ratio calculations.");
+      return;
+    }
+
+    ratioData = [
+      ["Ratio", "Value"],
+      ["Debt to Equity", (totalLiabilities / totalEquity).toFixed(2)],
+      ["Return on Equity (ROE)", ((netIncome / totalEquity) * 100).toFixed(2) + "%"],
+      ["Return on Assets (ROA)", ((netIncome / totalAssets) * 100).toFixed(2) + "%"],
+      ["Net Profit Margin", ((netIncome / revenue) * 100).toFixed(2) + "%"],
+      ["Current Ratio", (currentAssets / currentLiabilities).toFixed(2)]
+    ];
+
+    renderTable("ratiosTable", ratioData);
+  }
+
+  function calculateDetailedRatios() {
+    if (!balanceData.length || !plData.length) {
+      alert("Please fetch financial data first.");
+      return;
+    }
+
+    const getVal = (label, data) => {
+      const row = data.find(r => r[0] === label);
+      return row ? parseFloat(row[2]) : 0;
+    };
+
+    const shortTermDebt = getVal("Short Term Debt", balanceData) || 0;
+    const longTermDebt = getVal("Long Term Debt", balanceData) || 0;
+    const totalDebt = shortTermDebt + longTermDebt;
+    const equity = getVal("Total Equity", balanceData) || 0;
+    const interestExpense = getVal("Interest Expense", plData) || 0;
+    const netIncome = getVal("Net Income", plData) || 0;
+    const revenue = getVal("Revenue", plData) || 0;
+    const totalAssets = getVal("Total Assets", balanceData) || 0;
+
+    const beta = parseFloat(prompt("Enter Beta value:", "0.73")) || 0.73;
+    const riskFreeRate = parseFloat(prompt("Enter Risk-free rate (e.g., 0.0421):", "0.0421")) || 0.0421;
+    const marketReturn = parseFloat(prompt("Enter Market Return (e.g., 0.1205):", "0.1205")) || 0.1205;
+    const taxRate = parseFloat(prompt("Enter Tax rate (e.g., 0.168):", "0.168")) || 0.168;
+
+    const costOfDebt = totalDebt > 0 ? interestExpense / totalDebt : 0;
+    const costOfEquity = riskFreeRate + beta * (marketReturn - riskFreeRate);
+    const debtToEquity = equity > 0 ? totalDebt / equity : 0;
+    const roe = equity > 0 ? netIncome / equity : 0;
+    const roa = totalAssets > 0 ? netIncome / totalAssets : 0;
+
+    const equityWeight = equity / (equity + totalDebt);
+    const debtWeight = 1 - equityWeight;
+    const wacc = equityWeight * costOfEquity + debtWeight * costOfDebt * (1 - taxRate);
+
+    const dividend = parseFloat(prompt("Enter last annual dividend per share:", "0.12")) || 0;
+    const eps = parseFloat(prompt("Enter latest EPS:", "0.59")) || 0;
+    const payoutRatio = eps > 0 ? dividend / eps : 0;
+
+    const growthRate = roe * (1 - payoutRatio);
+
+    ratioData = [
+      ["Ratio", "Value"],
+      ["Short Term Debt (HKD)", shortTermDebt.toLocaleString()],
+      ["Long Term Debt (HKD)", longTermDebt.toLocaleString()],
+      ["Total Debt (HKD)", totalDebt.toLocaleString()],
+      ["Equity (HKD)", equity.toLocaleString()],
+      ["Interest Expense (HKD)", interestExpense.toLocaleString()],
+      ["Cost of Debt (Interest/Total Debt)", costOfDebt.toFixed(4)],
+      ["Cost of Equity (CAPM)", costOfEquity.toFixed(4)],
+      ["Debt to Equity Ratio", debtToEquity.toFixed(4)],
+      ["Return on Equity (ROE)", (roe * 100).toFixed(2) + "%"],
+      ["Return on Assets (ROA)", (roa * 100).toFixed(2) + "%"],
+      ["WACC", (wacc * 100).toFixed(2) + "%"],
+      ["Payout Ratio", payoutRatio.toFixed(4)],
+      ["Growth Rate", (growthRate * 100).toFixed(2) + "%"]
+    ];
+
+    renderTable("ratiosTable", ratioData);
+
+    // Save some valuation data for later
+    financialsForValuation = {
+      dividends: dividend,
+      growthRate: growthRate,
+      wacc: wacc,
+      fcf: parseFloat(prompt("Enter Free Cash Flow to Firm (FCF):", "0")) || 0,
+      totalDebt: totalDebt,
+      netIncome: netIncome,
+      bookValue: equity,
+      roe: roe,
+      sharesOutstanding: parseFloat(prompt("Enter shares outstanding:", "1000000000")) || 1e9,
+      peRatio: parseFloat(prompt("Enter current P/E ratio:", "15")) || 15
+    };
+  }
+
+  function performEquityValuation() {
+    if (!financialsForValuation.dividends || !financialsForValuation.wacc || !financialsForValuation.growthRate) {
+      alert("Please calculate detailed ratios first to populate inputs.");
+      return;
+    }
+    const d = financialsForValuation.dividends;
+    const g = financialsForValuation.growthRate;
+    const r = financialsForValuation.wacc;
+
+    if (r <= g) {
+      alert("WACC must be greater than growth rate for valuation.");
+      return;
+    }
+    const valuation = d * (1 + g) / (r - g);
+    document.getElementById("valuationOutput").textContent = `Simple Dividend Discount Model (DDM) Equity Valuation: HK$${valuation.toFixed(2)}`;
+  }
+
+  function runAdvancedValuation() {
+    if (!financialsForValuation || Object.keys(financialsForValuation).length === 0) {
+      alert("Please calculate detailed ratios first.");
+      return;
+    }
+    const d = financialsForValuation.dividends;
+    const g = financialsForValuation.growthRate;
+    const r = financialsForValuation.wacc;
+    const fcf = financialsForValuation.fcf;
+    const totalDebt = financialsForValuation.totalDebt;
+    const netIncome = financialsForValuation.netIncome;
+    const bookValue = financialsForValuation.bookValue;
+    const roe = financialsForValuation.roe;
+    const sharesOutstanding = financialsForValuation.sharesOutstanding;
+    const peRatio = financialsForValuation.peRatio;
+
+    if (r <= g) {
+      alert("WACC must be greater than growth rate for valuation.");
+      return;
+    }
+
+    // Dividend Discount Model
+    const ddmValue = d * (1 + g) / (r - g);
+
+    // FCFF Valuation (Enterprise Value)
+    const fcffValue = fcf * (1 + g) / (r - g);
+    const equityValueFromFCFF = fcffValue - totalDebt;
+
+    // Residual Income Model
+    const residualIncome = (roe - r) * bookValue;
+    const riValue = bookValue + residualIncome / r;
+
+    // Relative Valuation
+    const eps = netIncome / sharesOutstanding;
+    const relativeValuation = peRatio * eps;
+
+    const output = `
+CFA Advanced Equity Valuation:
+
+Dividend Discount Model (DDM) Equity Value: HK$${ddmValue.toFixed(2)}
+FCFF Valuation Equity Value: HK$${equityValueFromFCFF.toFixed(2)}
+Residual Income Model Equity Value: HK$${riValue.toFixed(2)}
+Relative Valuation (P/E * EPS): HK$${relativeValuation.toFixed(2)}
+    `;
+    document.getElementById("valuationOutput").textContent = output;
+  }
+
+  function getVal(label, data) {
+    const row = data.find(r => r[0] === label);
+    return row ? parseFloat(row[2]) : 0;
+  }
+
+  function showCompanyDetails() {
+    if (!submissionsData) {
+      alert("Fetch financials first");
+      return;
+    }
+    const info = `
+Company Name: ${submissionsData.entityName}
+CIK: ${currentCIK}
+SIC Code: ${submissionsData.sic}
+State Location: ${submissionsData.stateOfInc}
+Filing Count: ${submissionsData.filings.recent.form.length}
+Most Recent Filing Date: ${submissionsData.filings.recent.reportDate[0]}
+    `;
+    document.getElementById("companyDetails").textContent = info;
+  }
+
+  function showLatestDividend() {
+    if (!plData.length) {
+      alert("Fetch financials first");
+      return;
+    }
+    const eps = getVal("EPS Basic", plData);
+    const dividend = financialsForValuation.dividends || 0;
+    const payout = eps > 0 ? dividend / eps : 0;
+    const info = `
+Latest EPS (Basic): ${eps}
+Last Annual Dividend per Share: ${dividend}
+Payout Ratio: ${(payout * 100).toFixed(2)}%
+    `;
+    document.getElementById("dividendInfo").textContent = info;
+  }
+
+  function showAllStatementItems() {
+    if (!submissionsData) {
+      alert("Fetch financials first");
+      return;
+    }
+    // For demo, just list form types
+    const items = submissionsData.filings.recent.form;
+    alert("All recent statement items:\n" + items.join(", "));
+  }
+
+  function showStandardXBRLItems() {
+    alert("XBRL standard items include Assets, Liabilities, Equity, Revenue, Net Income, EPS, etc.");
+  }
+
+  function downloadCSV() {
+    if (!balanceData.length && !plData.length) {
+      alert("Fetch financial data first");
+      return;
+    }
+    let csv = "Section,Label,Date,Value (USD)\n";
+    csv += balanceData.slice(1).map(r => ["Balance Sheet", ...r].join(",")).join("\n") + "\n";
+    csv += plData.slice(1).map(r => ["Profit & Loss", ...r].join(",")).join("\n");
+
+    const blob = new Blob([csv], {type: "text/csv"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "financials.csv";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
+</script>
+
+</body>
+</html>

@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>XBRL Risk Report Generator (Basel II, US, UK)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --bg: #0f172a; --fg: #f8fafc; --muted: #cbd5e1;
+    --ok: #16a34a; --warn: #f59e0b; --bad: #dc2626; --panel: #111827;
+    --card: #1f2937; --accent: #38bdf8;
+  }
+  body { background: var(--bg); color: var(--fg); font-family: system-ui, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 0; }
+  header { padding: 24px; border-bottom: 1px solid #1e293b; }
+  h1 { margin: 0 0 6px; font-size: 20px; }
+  .sub { color: var(--muted); font-size: 13px; }
+  main { display: grid; grid-template-columns: 320px 1fr; gap: 20px; padding: 20px; }
+  .panel { background: var(--panel); border: 1px solid #1f2937; border-radius: 10px; padding: 16px; }
+  .section-title { font-size: 14px; color: var(--muted); margin: 16px 0 8px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  input[type="file"], select, input[type="number"], textarea { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #374151; background: #0b1220; color: var(--fg); }
+  input[type="number"] { text-align: right; }
+  .btn { display:inline-flex; align-items:center; gap:8px; padding:10px 14px; border-radius:8px; border:1px solid #374151; color: var(--fg); background:#0b1220; cursor:pointer; }
+  .btn-primary { background: #0ea5e9; border-color:#0ea5e9; color:#031525; font-weight:600; }
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+  .card { background: var(--card); border: 1px solid #374151; border-radius: 10px; padding: 14px; }
+  .kpi { display:flex; justify-content:space-between; margin: 6px 0; }
+  .kpi .label { color: var(--muted); font-size: 12px; }
+  .kpi .val { font-weight: 600; }
+  .pill { display:inline-block; padding:4px 8px; border-radius: 999px; font-size:11px; font-weight:600; }
+  .ok { background: #052b18; color: var(--ok); border:1px solid #064e3b; }
+  .warn { background: #2b1b05; color: var(--warn); border:1px solid #92400e; }
+  .bad { background: #2b0b0b; color: var(--bad); border:1px solid #7f1d1d; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+  details { background: #0b1220; border:1px solid #1f2937; border-radius:10px; padding:8px 12px; }
+  summary { cursor: pointer; color: var(--muted); }
+  .footer { padding: 12px 20px; color: var(--muted); border-top: 1px solid #1e293b; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>XBRL Risk Report Generator</h1>
+  <div class="sub">Basel II core ratios, RWA breakdown, and jurisdiction flags for US and UK. Upload your XBRL (XML).</div>
+</header>
+
+<main>
+  <!-- Controls -->
+  <section class="panel">
+    <div class="section-title">Upload XBRL</div>
+    <label for="xbrlFile">XBRL XML file</label>
+    <input id="xbrlFile" type="file" accept=".xml,.xbrl" />
+
+<input id="ticker" placeholder="Enter stock code (e.g. AAPL)" />
+<button onclick="downloadXBRL()">Download XBRL</button>
+
+    <div class="section-title">Jurisdiction</div>
+    <select id="jurisdiction">
+      <option value="basel2" selected>Basel II (global)</option>
+      <option value="us">United States (banking)</option>
+      <option value="uk">United Kingdom (banking)</option>
+    </select>
+
+    <div class="section-title">Thresholds (editable)</div>
+    <div class="grid">
+      <div>
+        <label>Total capital ratio min (%)</label>
+        <input id="minTotalCap" type="number" step="0.01" value="8" />
+      </div>
+      <div>
+        <label>Tier 1 capital ratio min (%)</label>
+        <input id="minTier1Cap" type="number" step="0.01" value="4" />
+      </div>
+      <div>
+        <label>Leverage ratio min (%)</label>
+        <input id="minLeverage" type="number" step="0.01" value="3" />
+      </div>
+      <div>
+        <label>Liquidity coverage ratio min (%)</label>
+        <input id="minLCR" type="number" step="0.01" value="100" />
+      </div>
+    </div>
+
+    <div class="section-title">Mapping config</div>
+    <details>
+      <summary>Common XBRL concepts to parse (edit as needed)</summary>
+      <label for="mapping" class="mono">JSON mapping (concept QName → metric)</label>
+      <textarea id="mapping" rows="12" class="mono">
+{
+  "coreCapitalTotal": ["coreCapitalTotal", "Tier1Capital", "uk-banking:T1Capital", "us-banking:Tier1Capital"],
+  "suppCapitalTotal": ["suppCapitalTotal", "Tier2Capital", "uk-banking:T2Capital", "us-banking:Tier2Capital"],
+  "riskWeightedAssetsTotal": ["riskWeightedAssetsTotal", "RiskWeightedAssets", "RWA", "uk-banking:RWA", "us-banking:RWA"],
+  "exposureAtDefault": ["ExposureAtDefault", "EAD", "Basel:EAD"],
+  "valueAtRisk": ["ValueAtRisk", "VaRTradingBook", "MarketRiskVaR"],
+  "operationalRiskCharge": ["OperationalRiskCharge", "OpRiskCharge", "Basel:ORC"],
+  "leverageDenominator": ["TotalExposureMeasure", "LeverageExposure", "Basel:LeverageExposure"],
+  "highQualityLiquidAssets": ["HQLA", "Liquidity:HighQualityLiquidAssets"],
+  "netCashOutflows30d": ["NetCashOutflows30d", "Liquidity:NetCashOutflows30d"],
+  "nplRatio": ["NonPerformingLoanRatio", "CreditQuality:NPLRatio"],
+  "stage3Loans": ["IFRS9Stage3Loans", "CreditQuality:Stage3Loans"]
+}
+      </textarea>
+    </details>
+
+    <div style="margin-top:12px; display:flex; gap:8px;">
+      <button class="btn btn-primary" id="parseBtn">Generate report</button>
+      <button class="btn" id="resetBtn">Reset</button>
+    </div>
+  </section>
+
+  <!-- Report -->
+  <section class="panel">
+    <div class="grid">
+      <div class="card">
+        <div class="section-title">Capital summary</div>
+        <div class="kpi"><span class="label">Tier 1 capital</span><span class="val" id="kpiT1">—</span></div>
+        <div class="kpi"><span class="label">Tier 2 capital</span><span class="val" id="kpiT2">—</span></div>
+        <div class="kpi"><span class="label">Total capital</span><span class="val" id="kpiTotalCap">—</span></div>
+        <div class="kpi"><span class="label">Risk-weighted assets (RWA)</span><span class="val" id="kpiRWA">—</span></div>
+      </div>
+
+      <div class="card">
+        <div class="section-title">Basel II ratios</div>
+        <div class="kpi"><span class="label">Total capital ratio</span><span class="val" id="ratioTotal">—</span></div>
+        <div class="kpi"><span class="label">Tier 1 capital ratio</span><span class="val" id="ratioTier1">—</span></div>
+        <div class="kpi"><span class="label">Leverage ratio</span><span class="val" id="ratioLeverage">—</span></div>
+        <div class="kpi"><span class="label">Liquidity coverage ratio (LCR)</span><span class="val" id="ratioLCR">—</span></div>
+      </div>
+
+      <div class="card">
+        <div class="section-title">Market & operational risk</div>
+        <div class="kpi"><span class="label">Trading VaR</span><span class="val" id="kpiVaR">—</span></div>
+        <div class="kpi"><span class="label">Operational risk charge</span><span class="val" id="kpiORC">—</span></div>
+      </div>
+
+      <div class="card">
+        <div class="section-title">Credit quality</div>
+        <div class="kpi"><span class="label">EAD</span><span class="val" id="kpiEAD">—</span></div>
+        <div class="kpi"><span class="label">NPL ratio</span><span class="val" id="kpiNPL">—</span></div>
+        <div class="kpi"><span class="label">IFRS 9 Stage 3 loans</span><span class="val" id="kpiStage3">—</span></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:12px;">
+      <div class="section-title">Jurisdiction assessment</div>
+      <div id="jurisdictionFlags"></div>
+    </div>
+
+    <div class="card" style="margin-top:12px;">
+      <div class="section-title">Audit trail</div>
+      <div class="mono" id="auditTrail">Awaiting upload…</div>
+    </div>
+  </section>
+</main>
+
+<div class="footer">
+  This tool parses common XBRL concepts. Edit the mapping if your taxonomy differs. Results are indicative only.
+</div>
+
+<script>
+
+function downloadXBRL() {
+  // Example: Apple, CIK 320193, accession 000032019323000010, file name
+  const cik = "320193";
+  const accession = "000032019323000010";
+  const filename = "aapl-20230930_htm.xml";
+
+  const url = `http://localhost:3000/api/download/${cik}/${accession}/${filename}`;
+  window.location.href = url; // triggers browser download
+}
+
+async function getCIK(ticker) {
+  const resp = await fetch("https://www.sec.gov/files/company_tickers.json");
+  const data = await resp.json();
+  const entry = Object.values(data).find(e => e.ticker === ticker.toUpperCase());
+  return entry ? entry.cik_str.toString().padStart(10, "0") : null;
+}
+
+document.getElementById("downloadEdgarBtn").addEventListener("click", async () => {
+  const ticker = document.getElementById("ticker").value.trim();
+  if (!ticker) return alert("Enter a stock code.");
+  const cik = await getCIK(ticker);
+  if (!cik) return alert("Ticker not found.");
+
+  const subResp = await fetch(`https://data.sec.gov/submissions/CIK${cik}.json`,
+    { headers: { "User-Agent": "YourName Contact@domain.com" } });
+  const subs = await subResp.json();
+  const recent = subs.filings.recent;
+  const acc = recent.accessionNumber[0].replace(/-/g, "");
+  const xbrlUrl = `https://www.sec.gov/Archives/edgar/data/${parseInt(cik)}/${acc}/index.json`;
+
+  const filingResp = await fetch(xbrlUrl, { headers: { "User-Agent": "YourName Contact@domain.com" } });
+  const filing = await filingResp.json();
+  const xbrlFile = filing.directory.item.find(f => f.name.endsWith(".xml"));
+  if (!xbrlFile) return alert("No XBRL found.");
+
+  const url = `https://www.sec.gov/Archives/edgar/data/${parseInt(cik)}/${acc}/${xbrlFile.name}`;
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${ticker}_xbrl.xml`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+});
+
+
+
+function fmt(n) {
+  if (n === null || n === undefined || isNaN(n)) return "—";
+  const abs = Math.abs(n);
+  const opts = abs < 1000 ? { maximumFractionDigits: 2 } : { maximumFractionDigits: 0 };
+  return Intl.NumberFormat(undefined, opts).format(n);
+}
+function pct(n) {
+  if (n === null || n === undefined || isNaN(n)) return "—";
+  return (n * 100).toFixed(2) + "%";
+}
+function classify(value, min) {
+  if (value === null || isNaN(value)) return '<span class="pill warn">missing</span>';
+  if (value >= min) return '<span class="pill ok">meets</span>';
+  if (value >= min * 0.75) return '<span class="pill warn">near</span>';
+  return '<span class="pill bad">breach</span>';
+}
+
+// Parse numeric content from XBRL XML by concept names
+function extractConcepts(xmlDoc, mapping) {
+  const nsAwareTexts = [];
+  const audit = [];
+  const vals = {};
+
+  function getFirstValue(names) {
+    for (const q of names) {
+      // Try any element with localName match or exact QName text
+      const nodes = Array.from(xmlDoc.getElementsByTagName(q));
+      for (const node of nodes) {
+        const v = parseFloat(node.textContent.trim());
+        if (!isNaN(v)) {
+          audit.push(`${q} = ${node.textContent.trim()}`);
+          return v;
+        }
+      }
+      // Fallback: search by local-name wildcard
+      const all = Array.from(xmlDoc.getElementsByTagName("*")).filter(n => {
+        const ln = n.localName || n.nodeName;
+        return ln === q || ln.endsWith(":" + q) || q.endsWith(":" + ln);
+      });
+      for (const node of all) {
+        const v = parseFloat(node.textContent.trim());
+        if (!isNaN(v)) {
+          audit.push(`${node.nodeName} = ${node.textContent.trim()}`);
+          return v;
+        }
+      }
+    }
+    return null;
+  }
+
+  vals.tier1 = getFirstValue(mapping.coreCapitalTotal || []);
+  vals.tier2 = getFirstValue(mapping.suppCapitalTotal || []);
+  vals.rwa = getFirstValue(mapping.riskWeightedAssetsTotal || []);
+  vals.ead = getFirstValue(mapping.exposureAtDefault || []);
+  vals.varTrading = getFirstValue(mapping.valueAtRisk || []);
+  vals.opRiskCharge = getFirstValue(mapping.operationalRiskCharge || []);
+  vals.leverageExpo = getFirstValue(mapping.leverageDenominator || []);
+  vals.hqla = getFirstValue(mapping.highQualityLiquidAssets || []);
+  vals.netOutflows = getFirstValue(mapping.netCashOutflows30d || []);
+  vals.nplRatio = getFirstValue(mapping.nplRatio || []);
+  vals.stage3Loans = getFirstValue(mapping.stage3Loans || []);
+
+  return { vals, audit };
+}
+
+function computeMetrics(vals) {
+  const totalCap = (vals.tier1 || 0) + (vals.tier2 || 0);
+  const totalCapRatio = (vals.rwa && vals.rwa !== 0) ? totalCap / vals.rwa : null;
+  const tier1Ratio = (vals.rwa && vals.rwa !== 0) ? vals.tier1 / vals.rwa : null;
+  const leverageRatio = (vals.leverageExpo && vals.leverageExpo !== 0) ? (vals.tier1 / vals.leverageExpo) : null;
+  const lcr = (vals.netOutflows && vals.netOutflows > 0 && vals.hqla) ? (vals.hqla / vals.netOutflows) : null;
+
+  return { totalCap, totalCapRatio, tier1Ratio, leverageRatio, lcr };
+}
+
+function jurisdictionAssessment(j, metrics, thresholds) {
+  const flags = [];
+
+  // Basel II core
+  flags.push({
+    label: "Total capital ratio",
+    value: metrics.totalCapRatio,
+    min: thresholds.minTotalCap / 100
+  });
+  flags.push({
+    label: "Tier 1 capital ratio",
+    value: metrics.tier1Ratio,
+    min: thresholds.minTier1Cap / 100
+  });
+  flags.push({
+    label: "Leverage ratio",
+    value: metrics.leverageRatio,
+    min: thresholds.minLeverage / 100
+  });
+  flags.push({
+    label: "Liquidity coverage ratio (LCR)",
+    value: metrics.lcr,
+    min: thresholds.minLCR / 100
+  });
+
+  // United States indicative checks (editable via thresholds or expand if needed)
+  if (j === "us") {
+    // Typical US PCA "well-capitalized" markers vary by rule set; keep generic editable thresholds.
+    flags.push({ label: "US total risk-based (target)", value: metrics.totalCapRatio, min: Math.max(thresholds.minTotalCap/100, 0.10) });
+    flags.push({ label: "US tier 1 risk-based (target)", value: metrics.tier1Ratio, min: Math.max(thresholds.minTier1Cap/100, 0.08) });
+    flags.push({ label: "US leverage ratio (target)", value: metrics.leverageRatio, min: Math.max(thresholds.minLeverage/100, 0.05) });
+  }
+
+  // United Kingdom indicative checks
+  if (j === "uk") {
+    // Core minimum 8% plus institution-specific buffers in practice; keep base threshold editable.
+    flags.push({ label: "UK total capital (baseline)", value: metrics.totalCapRatio, min: thresholds.minTotalCap/100 });
+    flags.push({ label: "UK tier 1 (baseline)", value: metrics.tier1Ratio, min: thresholds.minTier1Cap/100 });
+    flags.push({ label: "UK leverage ratio (baseline)", value: metrics.leverageRatio, min: thresholds.minLeverage/100 });
+  }
+
+  return flags;
+}
+
+function render(vals, metrics, flags, audit) {
+  // KPIs
+  document.getElementById("kpiT1").textContent = fmt(vals.tier1);
+  document.getElementById("kpiT2").textContent = fmt(vals.tier2);
+  document.getElementById("kpiTotalCap").textContent = fmt(metrics.totalCap);
+  document.getElementById("kpiRWA").textContent = fmt(vals.rwa);
+
+  document.getElementById("ratioTotal").innerHTML = metrics.totalCapRatio !== null ? pct(metrics.totalCapRatio) : "—";
+  document.getElementById("ratioTier1").innerHTML = metrics.tier1Ratio !== null ? pct(metrics.tier1Ratio) : "—";
+  document.getElementById("ratioLeverage").innerHTML = metrics.leverageRatio !== null ? pct(metrics.leverageRatio) : "—";
+  document.getElementById("ratioLCR").innerHTML = metrics.lcr !== null ? pct(metrics.lcr) : "—";
+
+  document.getElementById("kpiVaR").textContent = fmt(vals.varTrading);
+  document.getElementById("kpiORC").textContent = fmt(vals.opRiskCharge);
+
+  document.getElementById("kpiEAD").textContent = fmt(vals.ead);
+  document.getElementById("kpiNPL").textContent = vals.nplRatio !== null && !isNaN(vals.nplRatio) ? pct(vals.nplRatio) : "—";
+  document.getElementById("kpiStage3").textContent = fmt(vals.stage3Loans);
+
+  // Flags
+  const cont = document.getElementById("jurisdictionFlags");
+  cont.innerHTML = "";
+  flags.forEach(f => {
+    const row = document.createElement("div");
+    row.className = "kpi";
+    const label = document.createElement("span");
+    label.className = "label";
+    label.textContent = f.label;
+    const val = document.createElement("span");
+    val.className = "val";
+    val.innerHTML = (f.value !== null ? pct(f.value) : "—") + " " + classify(f.value, f.min);
+    row.appendChild(label); row.appendChild(val);
+    cont.appendChild(row);
+  });
+
+  // Audit trail
+  document.getElementById("auditTrail").textContent = audit.length ? audit.join("\n") : "No numeric concepts found with current mapping.";
+}
+
+function parseMapping() {
+  try {
+    return JSON.parse(document.getElementById("mapping").value);
+  } catch (e) {
+    alert("Invalid mapping JSON. Please fix and try again.");
+    throw e;
+  }
+}
+
+document.getElementById("parseBtn").addEventListener("click", async () => {
+  const file = document.getElementById("xbrlFile").files[0];
+  if (!file) {
+    alert("Please upload an XBRL XML file.");
+    return;
+  }
+  const j = document.getElementById("jurisdiction").value;
+  const thresholds = {
+    minTotalCap: parseFloat(document.getElementById("minTotalCap").value || "8"),
+    minTier1Cap: parseFloat(document.getElementById("minTier1Cap").value || "4"),
+    minLeverage: parseFloat(document.getElementById("minLeverage").value || "3"),
+    minLCR: parseFloat(document.getElementById("minLCR").value || "100")
+  };
+
+  const text = await file.text();
+  const parser = new DOMParser();
+  const xmlDoc = parser.parseFromString(text, "application/xml");
+
+  // Basic error check
+  const parseError = xmlDoc.getElementsByTagName("parsererror");
+  if (parseError.length) {
+    alert("Failed to parse XML. Please check the file.");
+    return;
+  }
+
+  const mapping = parseMapping();
+  const { vals, audit } = extractConcepts(xmlDoc, mapping);
+  const metrics = computeMetrics(vals);
+  const flags = jurisdictionAssessment(j, metrics, thresholds);
+  render(vals, metrics, flags, audit);
+});
+
+document.getElementById("resetBtn").addEventListener("click", () => {
+  document.getElementById("xbrlFile").value = "";
+  document.getElementById("jurisdiction").value = "basel2";
+  document.getElementById("minTotalCap").value = 8;
+  document.getElementById("minTier1Cap").value = 4;
+  document.getElementById("minLeverage").value = 3;
+  document.getElementById("minLCR").value = 100;
+  document.getElementById("jurisdictionFlags").innerHTML = "";
+  ["kpiT1","kpiT2","kpiTotalCap","kpiRWA","ratioTotal","ratioTier1","ratioLeverage","ratioLCR","kpiVaR","kpiORC","kpiEAD","kpiNPL","kpiStage3"].forEach(id=>{
+    document.getElementById(id).textContent = "—";
+  });
+  document.getElementById("auditTrail").textContent = "Awaiting upload…";
+});
+</script>
+</body>
+</html>
