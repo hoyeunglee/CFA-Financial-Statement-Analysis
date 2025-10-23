@@ -1,0 +1,13 @@
+{
+  "name": "edgar-viewer",
+  "version": "1.0.0",
+  "main": "server/proxy.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server/proxy.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-fetch": "^3.3.2"
+  }
+}
