@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Firm Value Calculator</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- SheetJS for xlsx parsing -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
+    h1, h2 { margin-bottom: 8px; }
+    .row { display: flex; gap: 24px; flex-wrap: wrap; }
+    .panel { border: 1px solid #ddd; border-radius: 8px; padding: 16px; flex: 1; min-width: 320px; }
+    label { display: block; margin: 8px 0 4px; font-weight: 600; }
+    input[type="file"], input[type="text"], select, button { padding: 8px; font-size: 14px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 8px; }
+    th, td { border: 1px solid #eee; padding: 6px 8px; text-align: right; }
+    th { background: #fafafa; text-align: left; }
+    .mono { font-family: ui-monospace, Menlo, Consolas, monospace; }
+    .warn { color: #b65; }
+    .ok { color: #286; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .small { font-size: 12px; color: #666; }
+    .code { white-space: pre-wrap; font-family: ui-monospace, Menlo, Consolas, monospace; background: #f7f7f7; padding: 8px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <h1>Firm Value Calculator</h1>
+  <p class="small">Upload your Excel, then compute firm value using integrated logic from income, balance, cash flow, ratio, firm value, and Black–Scholes sheets.</p>
+
+  <div class="row">
+    <div class="panel">
+      <h2>Upload Excel</h2>
+      <label for="fileInput">China_Mobile_Firm_Value.xlsx</label>
+      <input type="file" id="fileInput" accept=".xlsx,.xls" />
+      <div id="fileStatus" class="small mono" style="margin-top:8px;"></div>
+
+      <h2 style="margin-top:16px;">Compute</h2>
+      <button id="computeBtn">Compute Firm Value</button>
+      <div id="computeStatus" class="small mono" style="margin-top:8px;"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Optional: SEC proxy</h2>
+      <div class="grid-2">
+        <div>
+          <label for="tickerInput">Ticker</label>
+          <input type="text" id="tickerInput" placeholder="AAPL" />
+        </div>
+        <div style="align-self:end;">
+          <button id="loadTickerBtn">Find CIK</button>
+        </div>
+      </div>
+      <div id="secTicker" class="small mono" style="margin-top:8px;"></div>
+
+      <div class="grid-2" style="margin-top:12px;">
+        <div>
+          <label for="cikInput">CIK</label>
+          <input type="text" id="cikInput" placeholder="0000320193" />
+        </div>
+        <div style="align-self:end;">
+          <button id="loadSubmissionsBtn">Load submissions</button>
+        </div>
+      </div>
+      <div id="secSubmissions" class="small mono" style="margin-top:8px; max-height:120px; overflow:auto;"></div>
+
+      <div class="grid-2" style="margin-top:12px;">
+        <div>
+          <label for="conceptInput">us-gaap tag</label>
+          <input type="text" id="conceptInput" placeholder="Revenues" />
+        </div>
+        <div style="align-self:end;">
+          <button id="loadConceptBtn">Load concept</button>
+        </div>
+      </div>
+      <div id="secConcept" class="small mono" style="margin-top:8px; max-height:120px; overflow:auto;"></div>
+
+      <div class="grid-2" style="margin-top:12px;">
+        <div>
+          <label for="dlTickerInput">Auto-download latest XBRL</label>
+          <input type="text" id="dlTickerInput" placeholder="MSFT" />
+        </div>
+        <div style="align-self:end;">
+          <button id="downloadLatestBtn">Download</button>
+        </div>
+      </div>
+      <div id="secDownload" class="small mono" style="margin-top:8px;"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Results</h2>
+    <div id="summary" class="mono"></div>
+    <table id="resultsTable">
+      <thead>
+        <tr>
+          <th>Metric</th>
+          <th>2003</th>
+          <th>2004</th>
+          <th>2005</th>
+          <th>2006</th>
+          <th>2007</th>
+          <th>2008</th>
+        </tr>
+      </thead>
+      <tbody id="resultsBody"></tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>Notes and formula logic</h2>
+    <div class="code">
+- WACC:
+  • Cost of equity: CAPM = Rf + β · (Rm − Rf). If Rm missing, infer from PE or leave blank.
+  • Cost of debt (pre-tax): from Firm_Value or interest expense / average debt.
+  • Tax rate: Tax Expense / Pretax Income (guard for deferred tax).
+  • Weights: MV Equity / (MV Equity + Debt), and Debt / Total Capital.
+  • WACC = We * Ke + Wd * Kd * (1 − Tax).
+
+- FCFF (from CFO approach):
+  • FCFF ≈ CFO − (Capex − Proceeds from disposal of fixed assets).
+  • If ΔWorkingCapital known, refine: FCFF = EBIT(1−T) + Dep − Capex − ΔWC.
+
+- FCFE:
+  • FCFE = FCFF − Net Borrowing (ΔDebt − Debt Repayments) OR direct from CFO if equity cash flows known.
+
+- Residual Income:
+  • Equity charge = Cost of equity · Opening Book Equity.
+  • RI = Net Income − Equity charge.
+  • Intrinsic equity = Book Equity + PV(future RI).
+
+- Implied EPS:
+  • From equity value / shares.
+
+- Black–Scholes call:
+  • d1 = [ln(S/K) + (r + 0.5σ²)T] / (σ√T), d2 = d1 − σ√T
+  • Call = S·N(d1) − K·e^(−rT)·N(d2)
+    Use provided S, K, r, T, σ per row.
+
+- Guardrails:
+  • If inputs missing, skip metric and tag as N/A.
+  • Units consistency: ensure currency units align across sheets.
+    </div>
+  </div>
+
+  <script>
+    // Utilities
+    const toNum = v => {
+      const n = Number(String(v).replace(/[, ]/g, ''));
+      return Number.isFinite(n) ? n : null;
+    };
+    const safeDiv = (a, b) => (a != null && b != null && b !== 0 ? a / b : null);
+    const sum = arr => arr.filter(v => v != null).reduce((a,b)=>a+b, 0);
+    const mean = arr => {
+      const vals = arr.filter(v => v != null);
+      return vals.length ? sum(vals)/vals.length : null;
+    };
+    const exp = Math.exp;
+
+    // Normal CDF (approx) for Black–Scholes
+    function normCDF(x) {
+      return 0.5 * (1 + erf(x / Math.sqrt(2)));
+    }
+    function erf(x) {
+      // Abramowitz-Stegun approximation
+      const sign = x >= 0 ? 1 : -1;
+      x = Math.abs(x);
+      const a1=0.254829592, a2=-0.284496736, a3=1.421413741, a4=-1.453152027, a5=1.061405429, p=0.3275911;
+      const t = 1/(1+p*x);
+      const y = 1 - (((((a5*t + a4)*t) + a3)*t + a2)*t + a1)*t*Math.exp(-x*x);
+      return sign*y;
+    }
+
+    let workbookData = null;
+
+    document.getElementById('fileInput').addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      document.getElementById('fileStatus').textContent = 'Reading...';
+      const data = await file.arrayBuffer();
+      const wb = XLSX.read(data, { type: 'array' });
+      workbookData = {};
+      wb.SheetNames.forEach(name => {
+        workbookData[name] = XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, raw: true, defval: null });
+      });
+      document.getElementById('fileStatus').textContent = 'Loaded sheets: ' + wb.SheetNames.join(', ');
+    });
+
+    document.getElementById('computeBtn').addEventListener('click', () => {
+      if (!workbookData) {
+        document.getElementById('computeStatus').textContent = 'No workbook loaded.';
+        return;
+      }
+      document.getElementById('computeStatus').textContent = 'Computing...';
+      try {
+        const res = computeAll(workbookData);
+        renderResults(res);
+        document.getElementById('computeStatus').textContent = 'Done.';
+      } catch (err) {
+        document.getElementById('computeStatus').textContent = 'Error: ' + err.message;
+      }
+    });
+
+    function indexByHeader(rows) {
+      // Create a map from header label -> row index
+      const map = {};
+      rows.forEach((row, i) => {
+        const key = (row && row[0] != null) ? String(row[0]).trim() : null;
+        if (key) map[key] = i;
+      });
+      return map;
+    }
+
+    function extractYears(row) {
+      // Given a header row like [ '', 2003, 2004, 2005 ... ] return list of col indices by year
+      const map = {};
+      for (let c=0; c<row.length; c++) {
+        const y = toNum(row[c]);
+        if (y && y>1900 && y<2100) map[y] = c;
+      }
+      return map;
+    }
+
+    function getRowVals(rows, headerMap, label, yearsMap) {
+      const i = headerMap[label];
+      if (i == null) return {};
+      const row = rows[i];
+      const o = {};
+      Object.keys(yearsMap).forEach(y => {
+        o[y] = toNum(row[yearsMap[y]]);
+      });
+      return o;
+    }
+
+    function computeAll(data) {
+      // Sheets
+      const IS = data['Incomestatement'] || data['Income statement'] || data['income statement'] || [];
+      const BS = data['Balancesheet'] || [];
+      const CF = data['Cashflow'] || [];
+      const FV = data['Firm_Value'] || [];
+      const RS = data['Ratio'] || [];
+      const BSopt = data['Black_Scholes'] || [];
+
+      // Income Statement parsing
+      const isHeadRow = IS.find(r => r.some(v => v===2004 || v===2005)) || IS[0] || [];
+      const isYears = extractYears(isHeadRow);
+      const isMap = indexByHeader(IS);
+
+      const Turnover = getRowVals(IS, isMap, 'Turnover', isYears);
+      const OpCosts = getRowVals(IS, isMap, 'Operating costs', isYears);
+      const OtherIncome = getRowVals(IS, isMap, 'Other income', isYears);
+      const SDE = getRowVals(IS, isMap, 'Selling and distribution expense', isYears);
+      const Admin = getRowVals(IS, isMap, 'Administrative and general expenses', isYears);
+      const OtherNet = getRowVals(IS, isMap, 'other income, net', isYears);
+      const FinanceCosts = getRowVals(IS, isMap, 'Finance costs', isYears);
+      const Assoc = getRowVals(IS, isMap, 'Share of profit of an associated company', isYears);
+      const JCE = getRowVals(IS, isMap, 'Share of profit of joint controlled company', isYears);
+      const TaxExp = getRowVals(IS, isMap, 'Income tax expense', isYears);
+      const NIAttrib = getRowVals(IS, isMap, 'Attributable to Equity holders of the Company', isYears);
+      const Minority = getRowVals(IS, isMap, 'Minority interest', isYears);
+      const DividendsIS = getRowVals(IS, isMap, 'Dividends', isYears);
+      const EPSrow = getRowVals(IS, isMap, 'Basic earning per share', isYears);
+
+      // Balance Sheet parsing
+      const bsHeadRow = BS.find(r => r.some(v => v===2004 || v===2005)) || BS[0] || [];
+      const bsYears = extractYears(bsHeadRow);
+      const bsMap = indexByHeader(BS);
+
+      const PPE = getRowVals(BS, bsMap, 'Property, plant and equipment', bsYears);
+      const Intang = getRowVals(BS, bsMap, 'Intangible assets', bsYears);
+      const Inventory = getRowVals(BS, bsMap, 'Inventories', bsYears);
+      const TradeAR = getRowVals(BS, bsMap, 'Trade receivables', bsYears);
+      const Cash = getRowVals(BS, bsMap, 'Bank balances and cash', bsYears);
+      const CLTrade = getRowVals(BS, bsMap, 'Trade and bills payables', bsYears);
+      const CLOther = getRowVals(BS, bsMap, 'Other payables and accruals', bsYears);
+      const CLBank = getRowVals(BS, bsMap, 'Bank borrowings', bsYears);
+      const EquityShareCap = getRowVals(BS, bsMap, 'Share capital', bsYears);
+      const EquityRes = getRowVals(BS, bsMap, 'Other reserves', bsYears);
+      const EquityRE = getRowVals(BS, bsMap, 'Retained earnings', bsYears);
+      const MinorityEquity = getRowVals(BS, bsMap, 'Minority interest', bsYears);
+      const NonCurrentBankBor = getRowVals(BS, bsMap, 'Bank borrowings', bsYears); // also appears under non-current
+
+      // Cash Flow parsing
+      const cfHeadRow = CF.find(r => r.some(v => v===2003 || v===2004 || v===2005)) || CF[0] || [];
+      const cfYears = extractYears(cfHeadRow);
+      const cfMap = indexByHeader(CF);
+      const CashFromOps = getRowVals(CF, cfMap, 'Net cash generated from operating activities', cfYears);
+      const CashGenOps = getRowVals(CF, cfMap, 'Cash generated from operations', cfYears);
+      const TaxPaidCF = getRowVals(CF, cfMap, 'Income tax paid', cfYears);
+      const Capex = getRowVals(CF, cfMap, 'Purchase of fixed assets', cfYears);
+      const PPEProceeds = getRowVals(CF, cfMap, 'Proceeds from disposal of fixed assets', cfYears);
+      const InterestReceivedCF = getRowVals(CF, cfMap, 'Interest received', cfYears);
+
+      // Firm_Value sheet parsing
+      const fvHeadRow = FV.find(r => r.some(v => v===2003 || v===2004 || v===2005 || v===2006 || v===2007 || v===2008)) || FV[0] || [];
+      const fvYears = extractYears(fvHeadRow);
+      const fvMap = indexByHeader(FV);
+      const LongDebtFV = getRowVals(FV, fvMap, 'Long term debt', fvYears);
+      const InterestExpFV = getRowVals(FV, fvMap, 'Interest Expense', fvYears);
+      const PEHangSeng = getRowVals(FV, fvMap, 'PE ratio ( percentage ) of Hang Seng Index', fvYears);
+      const DividendFV = getRowVals(FV, fvMap, 'Dividend', fvYears);
+      const EPSFV = getRowVals(FV, fvMap, 'EPS', fvYears);
+      const ROEFV = getRowVals(FV, fvMap, 'ROE', fvYears);
+      const BetaFV = getRowVals(FV, fvMap, 'Beta', fvYears);
+      const RfFV = getRowVals(FV, fvMap, 'Risk-Free Rate', fvYears);
+      const PriceFV = getRowVals(FV, fvMap, 'Price ( year ended? )', fvYears);
+      const CostDebtNotes = getRowVals(FV, fvMap, 'Cost of debt from notes to account', fvYears);
+      const ProfitAttr = getRowVals(FV, fvMap, 'Profit attributable to shareholder', fvYears);
+      const PretaxIncome = getRowVals(FV, fvMap, 'Pretax Income', fvYears);
+      const TaxExpenseFV = getRowVals(FV, fvMap, 'Tax Expense ( Be care ful deferred tax )', fvYears);
+      const CFOFV = getRowVals(FV, fvMap, 'CFO', fvYears);
+      const PPEFV = getRowVals(FV, fvMap, 'Property, Plant and Equipment(Fixed Asset)', fvYears);
+      const TCLFV = getRowVals(FV, fvMap, 'Total Current Liabilities', fvYears);
+
+      // Black-Scholes parsing
+      const bsoptHeadRow = BSopt.find(r => r.some(v => v=== 'Current Price')) || BSopt[0] || [];
+      const bsoptMap = indexByHeader(BSopt);
+
+      // Years to compute (union)
+      const years = Array.from(new Set([
+        ...Object.keys(isYears).map(Number),
+        ...Object.keys(bsYears).map(Number),
+        ...Object.keys(cfYears).map(Number),
+        ...Object.keys(fvYears).map(Number)
+      ])).sort((a,b)=>a-b);
+
+      // Derived equity book value per year
+      const BookEquity = {};
+      years.forEach(y => {
+        const be = sum([
+          EquityShareCap[y], EquityRes[y], EquityRE[y], MinorityEquity[y]
+        ].filter(v => v != null));
+        BookEquity[y] = be || null;
+      });
+
+      // Shares outstanding from Profit / EPS if provided
+      const Shares = {};
+      years.forEach(y => {
+        const profit = ProfitAttr[y] ?? NIAttrib[y];
+        const eps = EPSFV[y] ?? EPSrow[y];
+        Shares[y] = (profit != null && eps != null && eps !== 0) ? (profit / eps) : null;
+      });
+
+      // Market value of equity from Price * Shares, fallback from firm_value if present later
+      const MVEquity = {};
+      years.forEach(y => {
+        const price = PriceFV[y];
+        const sh = Shares[y];
+        MVEquity[y] = (price != null && sh != null) ? price * sh : null;
+      });
+
+      // Total debt: prefer firm_value long term debt + (current bank borrowings if available)
+      const TotalDebt = {};
+      years.forEach(y => {
+        const longD = LongDebtFV[y] ?? NonCurrentBankBor[y];
+        const currD = CLBank[y]; // from BS
+        TotalDebt[y] = sum([longD, currD].filter(v=>v!=null)) || longD || currD || null;
+      });
+
+      // Tax rate = TaxExpense / PretaxIncome
+      const TaxRate = {};
+      years.forEach(y => {
+        TaxRate[y] = safeDiv(TaxExpenseFV[y] ?? TaxExp[y], PretaxIncome[y]);
+      });
+
+      // Cost of debt: prefer notes, else interest expense / average total debt
+      const CostDebt = {};
+      years.forEach((y, idx) => {
+        let kd = CostDebtNotes[y];
+        if (kd == null) {
+          const interest = InterestExpFV[y] ?? FinanceCosts[y];
+          const prevYear = years[idx-1];
+          const avgDebt = prevYear != null && TotalDebt[prevYear] != null && TotalDebt[y] != null
+            ? (TotalDebt[prevYear] + TotalDebt[y]) / 2
+            : TotalDebt[y];
+          kd = safeDiv(interest, avgDebt);
+        }
+        CostDebt[y] = kd ?? null;
+      });
+
+      // Market risk premium: if not provided, try infer from PE of index: Rm ≈ Rf + (1/PE - Rf) — simplistic
+      const Rm = {};
+      years.forEach(y => {
+        const rf = RfFV[y];
+        const pePct = PEHangSeng[y]; // seems given as fraction e.g. 0.18, not multiple
+        // If pePct is fraction of yield (e.g., "PE ratio ( percentage ) of Hang Seng Index" might be earnings yield),
+        // use Rm ≈ rf + pePct (if pePct looks like 16% etc.)
+        let rm = null;
+        if (rf != null && pePct != null) {
+          rm = rf + pePct; // pragmatic fallback
+        }
+        Rm[y] = rm;
+      });
+
+      // Cost of equity using CAPM
+      const CostEquity = {};
+      years.forEach(y => {
+        const rf = RfFV[y];
+        const beta = BetaFV[y];
+        const rm = Rm[y];
+        CostEquity[y] = (rf != null && beta != null && rm != null) ? (rf + beta * (rm - rf)) : null;
+      });
+
+      // Weights
+      const Wd = {};
+      const We = {};
+      years.forEach(y => {
+        const eq = MVEquity[y];
+        const debt = TotalDebt[y];
+        const totalCap = sum([eq, debt].filter(v=>v!=null));
+        Wd[y] = safeDiv(debt, totalCap);
+        We[y] = safeDiv(eq, totalCap);
+      });
+
+      // WACC
+      const WACC = {};
+      years.forEach(y => {
+        const we = We[y], ke = CostEquity[y], wd = Wd[y], kd = CostDebt[y], t = TaxRate[y];
+        WACC[y] = (we != null && ke != null && wd != null && kd != null && t != null)
+          ? (we*ke + wd*kd*(1 - t))
+          : null;
+      });
+
+      // FCFF using CFO and capex
+      const FCFF = {};
+      years.forEach(y => {
+        const cfo = CFOFV[y] ?? CashFromOps[y] ?? CashGenOps[y];
+        const capex = Capex[y];
+        const proceeds = PPEProceeds[y];
+        FCFF[y] = (cfo != null && capex != null)
+          ? (cfo - (capex - (proceeds ?? 0)))
+          : null;
+      });
+
+      // Net borrowing approximation: change in total debt (uses adjacent years)
+      const NetBorrowing = {};
+      years.forEach((y, idx) => {
+        const prev = years[idx-1];
+        NetBorrowing[y] = (prev != null && TotalDebt[y] != null && TotalDebt[prev] != null)
+          ? (TotalDebt[y] - TotalDebt[prev])
+          : null;
+      });
+
+      // FCFE = FCFF − Net Borrowing
+      const FCFE = {};
+      years.forEach(y => {
+        const fcff = FCFF[y];
+        const nb = NetBorrowing[y];
+        FCFE[y] = (fcff != null && nb != null) ? (fcff - nb) : null;
+      });
+
+      // Residual Income
+      const EquityCharge = {};
+      const ResidualIncome = {};
+      years.forEach((y, idx) => {
+        const prev = years[idx-1];
+        const ke = CostEquity[y];
+        const openingBE = prev != null ? BookEquity[prev] : null;
+        EquityCharge[y] = (ke != null && openingBE != null) ? (ke * openingBE) : null;
+        const ni = ProfitAttr[y] ?? NIAttrib[y];
+        ResidualIncome[y] = (ni != null && EquityCharge[y] != null) ? (ni - EquityCharge[y]) : null;
+      });
+
+      // Simple single-stage firm valuation (illustrative): Value ≈ FCFF_{t} * (1 + g) / (WACC − g)
+      // Choose a terminal year with available FCFF, estimate growth from ROE * (1 - payout) if possible
+      const Growth = {};
+      years.forEach(y => {
+        const roe = ROEFV[y];
+        const div = DividendFV[y];
+        const eps = EPSFV[y];
+        const payout = (div != null && eps != null && eps !== 0) ? (div / eps) : null;
+        Growth[y] = (roe != null && payout != null) ? (roe * (1 - payout)) : null;
+      });
+
+      // Terminal value per year (if possible). You may prefer last year for a DCF; here just compute each if g<WACC.
+      const FirmValueFCFF = {};
+      years.forEach(y => {
+        const fcff = FCFF[y];
+        const wacc = WACC[y];
+        const g = Growth[y];
+        FirmValueFCFF[y] = (fcff != null && wacc != null && g != null && wacc > g)
+          ? (fcff * (1 + g) / (wacc - g))
+          : null;
+      });
+
+      // Equity value from FCFE similarly
+      const FirmValueFCFE = {};
+      years.forEach(y => {
+        const fcfe = FCFE[y];
+        const ke = CostEquity[y];
+        const g = Growth[y];
+        FirmValueFCFE[y] = (fcfe != null && ke != null && g != null && ke > g)
+          ? (fcfe * (1 + g) / (ke - g))
+          : null;
+      });
+
+      // Implied EPS from firm value / shares
+      const EPSfromFCFF = {};
+      const EPSfromFCFE = {};
+      years.forEach(y => {
+        const sh = Shares[y];
+        EPSfromFCFF[y] = (FirmValueFCFF[y] != null && sh != null && sh !== 0)
+          ? (FirmValueFCFF[y] / sh)
+          : null;
+        EPSfromFCFE[y] = (FirmValueFCFE[y] != null && sh != null && sh !== 0)
+          ? (FirmValueFCFE[y] / sh)
+          : null;
+      });
+
+      // Black–Scholes options rows: use all rows where keys exist
+      const BSOptions = [];
+      for (let i=0; i<BSopt.length; i++) {
+        const row = BSopt[i];
+        const key = row && row[0] ? String(row[0]).trim() : null;
+        if (key === 'Current Price') {
+          // Expect structure in blocks:
+          // Number, Current Price, Executed Price, Risk-free rate, Maturity, Volatility...
+          // Pull subsequent rows by label
+          const block = {};
+          const m = indexByHeader(BSopt.slice(i, i+20)); // local block window
+          function getVal(lbl) {
+            const idx = m[lbl];
+            if (idx == null) return null;
+            return toNum(BSopt[i+idx][1]); // value in second column
+          }
+          const S = getVal('Current Price');
+          const K = getVal('Executed Price');
+          const r = getVal('Risk-free rate');
+          const T = getVal('Maturity');
+          const sigma = getVal('Volatility');
+          if ([S,K,r,T,sigma].every(v => v != null)) {
+            const d1 = (Math.log(S/K) + (r + 0.5*sigma*sigma)*T) / (sigma*Math.sqrt(T));
+            const d2 = d1 - sigma*Math.sqrt(T);
+            const Nd1 = normCDF(d1);
+            const Nd2 = normCDF(d2);
+            const call = S*Nd1 - K*exp(-r*T)*Nd2;
+            BSOptions.push({ S,K,r,T,sigma,d1,d2,Nd1,Nd2,call });
+          }
+        }
+      }
+
+      // Assemble results
+      return {
+        years,
+        Turnover, OpCosts, OtherIncome, SDE, Admin, OtherNet, FinanceCosts, Assoc, JCE, TaxExp,
+        NIAttrib, Minority, DividendsIS, EPSrow,
+        PPE, Intang, Inventory, TradeAR, Cash, CLTrade, CLOther, CLBank,
+        BookEquity, Shares, MVEquity, TotalDebt,
+        TaxRate, CostDebt, Rm, CostEquity, Wd, We, WACC,
+        FCFF, NetBorrowing, FCFE,
+        EquityCharge, ResidualIncome,
+        Growth,
+        FirmValueFCFF, FirmValueFCFE,
+        EPSfromFCFF, EPSfromFCFE,
+        BSOptions
+      };
+    }
+
+    function renderResults(r) {
+      const summary = document.getElementById('summary');
+      const body = document.getElementById('resultsBody');
+      body.innerHTML = '';
+
+      function row(label, getter) {
+        const tr = document.createElement('tr');
+        const th = document.createElement('th');
+        th.textContent = label;
+        tr.appendChild(th);
+        r.years.forEach(y => {
+          const td = document.createElement('td');
+          const v = getter(y);
+          td.textContent = (v == null) ? 'N/A' : Intl.NumberFormat('en-US', { maximumFractionDigits: 3 }).format(v);
+          tr.appendChild(td);
+        });
+        body.appendChild(tr);
+      }
+
+      row('Turnover', y => r.Turnover[y]);
+      row('Operating costs', y => r.OpCosts[y]);
+      row('Net income (attrib.)', y => r.NIAttrib[y]);
+      row('Shares outstanding', y => r.Shares[y]);
+      row('Market value of equity', y => r.MVEquity[y]);
+      row('Total debt', y => r.TotalDebt[y]);
+      row('Tax rate', y => r.TaxRate[y]);
+      row('Cost of debt', y => r.CostDebt[y]);
+      row('Cost of equity (CAPM)', y => r.CostEquity[y]);
+      row('Wd', y => r.Wd[y]);
+      row('We', y => r.We[y]);
+      row('WACC', y => r.WACC[y]);
+      row('FCFF', y => r.FCFF[y]);
+      row('Net borrowing', y => r.NetBorrowing[y]);
+      row('FCFE', y => r.FCFE[y]);
+      row('Equity charge', y => r.EquityCharge[y]);
+      row('Residual income', y => r.ResidualIncome[y]);
+      row('Growth (ROE·(1−payout))', y => r.Growth[y]);
+      row('Firm value (FCFF Gordon)', y => r.FirmValueFCFF[y]);
+      row('Firm value (FCFE Gordon)', y => r.FirmValueFCFE[y]);
+      row('Implied EPS (FCFF)', y => r.EPSfromFCFF[y]);
+      row('Implied EPS (FCFE)', y => r.EPSfromFCFE[y]);
+
+      const opt = r.BSOptions;
+      const optLines = opt.map(o =>
+        `Call=${o.call.toFixed(4)} | S=${o.S}, K=${o.K}, r=${o.r}, T=${o.T}, σ=${o.sigma}, d1=${o.d1.toFixed(3)}, d2=${o.d2.toFixed(3)}`
+      );
+      summary.innerHTML = `
+        <div><strong>Years:</strong> ${r.years.join(', ')}</div>
+        <div class="small">Black–Scholes calls (${opt.length} rows):</div>
+        <div class="mono small">${optLines.join('\n')}</div>
+      `;
+    }
+
+    // SEC proxy actions
+    document.getElementById('loadTickerBtn').addEventListener('click', async () => {
+      const t = document.getElementById('tickerInput').value.trim();
+      if (!t) return;
+      const el = document.getElementById('secTicker');
+      el.textContent = 'Loading tickers...';
+      try {
+        const res = await fetch('/api/tickers');
+        const data = await res.json();
+        const entry = Object.values(data).find(e => e.ticker === t.toUpperCase());
+        if (!entry) {
+          el.textContent = 'Ticker not found.';
+          return;
+        }
+        el.textContent = `Found: ${entry.title} | CIK=${entry.cik_str}`;
+        document.getElementById('cikInput').value = String(entry.cik_str).padStart(10, '0');
+      } catch (err) {
+        el.textContent = 'Error: ' + err.message;
+      }
+    });
+
+    document.getElementById('loadSubmissionsBtn').addEventListener('click', async () => {
+      const cik = document.getElementById('cikInput').value.trim();
+      if (!cik) return;
+      const el = document.getElementById('secSubmissions');
+      el.textContent = 'Loading submissions...';
+      try {
+        const res = await fetch('/api/submissions/' + cik);
+        const data = await res.json();
+        const recent = data?.filings?.recent;
+        if (!recent) {
+          el.textContent = 'No recent filings.';
+          return;
+        }
+        const lines = recent.form
+          .map((f, i) => `${recent.accessionNumber[i]} | ${f} | ${recent.filingDate[i]}`)
+          .slice(0, 20)
+          .join('\n');
+        el.textContent = lines;
+      } catch (err) {
+        el.textContent = 'Error: ' + err.message;
+      }
+    });
+
+    document.getElementById('loadConceptBtn').addEventListener('click', async () => {
+      const cik = document.getElementById('cikInput').value.trim();
+      const tag = document.getElementById('conceptInput').value.trim();
+      if (!cik || !tag) return;
+      const el = document.getElementById('secConcept');
+      el.textContent = 'Loading concept...';
+      try {
+        const res = await fetch(`/api/concept/${cik}/${encodeURIComponent(tag)}`);
+        const data = await res.json();
+        const units = data?.units ? Object.values(data.units)[0] : null;
+        const lines = units ? units.slice(0, 20).map(u => `${u.fy} ${u.fp} | ${u.val}`).join('\n') : 'No data.';
+        el.textContent = lines;
+      } catch (err) {
+        el.textContent = 'Error: ' + err.message;
+      }
+    });
+
+    document.getElementById('downloadLatestBtn').addEventListener('click', async () => {
+      const t = document.getElementById('dlTickerInput').value.trim();
+      const el = document.getElementById('secDownload');
+      if (!t) return;
+      el.textContent = 'Downloading...';
+      try {
+        const res = await fetch('/api/download-latest/' + t);
+        if (!res.ok) {
+          el.textContent = 'Error: ' + (await res.text());
+          return;
+        }
+        // Create a blob and trigger download
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = t + '-latest-xbrl.xml';
+        a.click();
+        URL.revokeObjectURL(url);
+        el.textContent = 'Downloaded latest XBRL file.';
+      } catch (err) {
+        el.textContent = 'Error: ' + err.message;
+      }
+    });
+  </script>
+</body>
+</html>
