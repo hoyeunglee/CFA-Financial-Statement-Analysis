@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Firm Value Automation (Full)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 24px; }
+    h1, h2 { margin-bottom: 8px; }
+    .panel { border: 1px solid #ccc; border-radius: 8px; padding: 16px; margin-bottom: 24px; }
+    label { display: block; margin: 8px 0 4px; font-weight: 600; }
+    input[type="file"], select, input[type="range"], button { padding: 6px; font-size: 14px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 8px; }
+    th, td { border: 1px solid #eee; padding: 4px 6px; text-align: right; }
+    th { background: #f9f9f9; text-align: left; }
+    .mono { font-family: ui-monospace, Menlo, Consolas, monospace; }
+    .small { font-size: 12px; color: #666; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .slider-label { display: flex; justify-content: space-between; align-items: center; }
+  </style>
+</head>
+<body>
+  <h1>📊 Firm Value Automation</h1>
+  <p class="small">Upload your Excel, inspect all sheets, and simulate key drivers. Ratios and firm value are fully automated and respond to simulation.</p>
+
+  <div class="panel">
+    <h2>Upload Excel</h2>
+    <input type="file" id="fileInput" accept=".xlsx,.xls" />
+    <div id="fileStatus" class="small mono" style="margin-top:8px;"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Sheet viewer with simulation column</h2>
+    <div class="grid2">
+      <div>
+        <label for="sheetSelect">Select sheet</label>
+        <select id="sheetSelect"></select>
+      </div>
+      <div>
+        <label for="yearSelect">Latest year column (detected by default)</label>
+        <select id="yearSelect"></select>
+      </div>
+    </div>
+    <div style="max-height:420px; overflow:auto;">
+      <table id="sheetTable"><thead></thead><tbody></tbody></table>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Simulation controls</h2>
+    <div class="slider-label">
+      <label for="currentRatioSlider">Current ratio</label>
+      <span id="currentRatioValue">1.50</span>
+    </div>
+    <input type="range" id="currentRatioSlider" min="0.5" max="3" step="0.1" value="1.5" />
+
+    <div class="slider-label" style="margin-top:16px;">
+      <label for="opMarginSlider">Operating margin</label>
+      <span id="opMarginValue">0.20</span>
+    </div>
+    <input type="range" id="opMarginSlider" min="0.05" max="0.5" step="0.01" value="0.20" />
+
+    <button id="simulateBtn" style="margin-top:16px;">Apply simulation</button>
+    <div id="simulateStatus" class="small mono" style="margin-top:8px;"></div>
+  </div>
+
+  <div class="panel">
+    <h2>Automated ratios</h2>
+    <table id="ratiosTable"><thead><tr><th>Ratio / metric</th><th>Value (latest year, simulated)</th></tr></thead><tbody></tbody></table>
+  </div>
+
+  <div class="panel">
+    <h2>Automated firm value metrics</h2>
+    <table id="firmValueTable"><thead><tr><th>Metric</th><th>Value (latest year, simulated)</th></tr></thead><tbody></tbody></table>
+  </div>
+
+  <script>
+    // Helpers
+    const toNum = v => {
+      if (v == null) return null;
+      const n = Number(String(v).replace(/[, ]/g, ''));
+      return Number.isFinite(n) ? n : null;
+    };
+    const safeDiv = (a, b) => (a != null && b != null && b !== 0 ? a / b : null);
+    const sum = arr => arr.filter(v => v != null).reduce((a,b)=>a+b, 0);
+    const exp = Math.exp;
+
+    // CAPM normal cdf (for potential BS later)
+    function normCDF(x) {
+      return 0.5 * (1 + erf(x / Math.sqrt(2)));
+    }
+    function erf(x) {
+      const sign = x >= 0 ? 1 : -1; x = Math.abs(x);
+      const a1=0.254829592, a2=-0.284496736, a3=1.421413741, a4=-1.453152027, a5=1.061405429, p=0.3275911;
+      const t = 1/(1+p*x);
+      const y = 1 - (((((a5*t + a4)*t) + a3)*t + a2)*t + a1)*t*Math.exp(-x*x);
+      return sign*y;
+    }
+
+    let workbookData = null;
+    let latestYearColIdx = null; // per selected sheet
+    let lastSim = {}; // stash key simulated values for cross-sheet metrics
+
+    // Load file
+    document.getElementById('fileInput').addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const status = document.getElementById('fileStatus');
+      status.textContent = 'Reading workbook...';
+      const data = await file.arrayBuffer();
+      const wb = XLSX.read(data, { type: 'array' });
+      workbookData = {};
+      wb.SheetNames.forEach(name => {
+        workbookData[name] = XLSX.utils.sheet_to_json(wb.Sheets[name], { header: 1, raw: true, defval: null });
+      });
+      status.textContent = 'Loaded sheets: ' + wb.SheetNames.join(', ');
+
+      const sheetSel = document.getElementById('sheetSelect');
+      sheetSel.innerHTML = '';
+      wb.SheetNames.forEach(name => {
+        const opt = document.createElement('option');
+        opt.value = name; opt.textContent = name;
+        sheetSel.appendChild(opt);
+      });
+
+      // Pre-populate year list from first sheet
+      renderSheet(wb.SheetNames[0]);
+      populateYearSelector(wb.SheetNames[0]);
+    });
+
+    // Change sheet
+    document.getElementById('sheetSelect').addEventListener('change', (e) => {
+      renderSheet(e.target.value);
+      populateYearSelector(e.target.value);
+    });
+
+    // Year selection
+    document.getElementById('yearSelect').addEventListener('change', (e) => {
+      latestYearColIdx = Number(e.target.value);
+      renderSheet(document.getElementById('sheetSelect').value);
+    });
+
+    // Populate year selector from header row numeric columns
+    function populateYearSelector(sheetName) {
+      const rows = workbookData[sheetName] || [];
+      const yearSel = document.getElementById('yearSelect');
+      yearSel.innerHTML = '';
+      if (!rows.length) return;
+      const header = rows[0];
+      let maxYear = -Infinity, maxIdx = -1;
+      header.forEach((h, i) => {
+        const y = parseInt(h);
+        if (!isNaN(y) && y>1900 && y<2100) {
+          const opt = document.createElement('option');
+          opt.value = i; opt.textContent = String(y);
+          yearSel.appendChild(opt);
+          if (y > maxYear) { maxYear = y; maxIdx = i; }
+        }
+      });
+      latestYearColIdx = maxIdx >= 0 ? maxIdx : 1; // fallback to 2nd column
+      if (maxIdx >= 0) yearSel.value = String(maxIdx);
+    }
+
+    // Render selected sheet with Simulated column
+    function renderSheet(name) {
+      const rows = workbookData[name] || [];
+      const thead = document.querySelector('#sheetTable thead');
+      const tbody = document.querySelector('#sheetTable tbody');
+      thead.innerHTML = ''; tbody.innerHTML = '';
+      if (!rows.length) return;
+
+      const headerRow = document.createElement('tr');
+      rows[0].forEach((h,i) => {
+        const th = document.createElement('th');
+        th.textContent = h || `Col${i}`;
+        headerRow.appendChild(th);
+      });
+      const thSim = document.createElement('th');
+      thSim.textContent = 'Simulated';
+      headerRow.appendChild(thSim);
+      thead.appendChild(headerRow);
+
+      const latestIdx = latestYearColIdx ?? -1;
+      rows.slice(1).forEach(row => {
+        const tr = document.createElement('tr');
+        row.forEach(cell => {
+          const td = document.createElement('td');
+          td.textContent = cell;
+          tr.appendChild(td);
+        });
+        const tdSim = document.createElement('td');
+        tdSim.className = 'sim-cell';
+        tdSim.dataset.sheet = name;
+        tdSim.dataset.label = String(row[0] || '').trim();
+        tdSim.dataset.base = latestIdx >= 0 ? (row[latestIdx] ?? '') : '';
+        tdSim.textContent = tdSim.dataset.base;
+        tr.appendChild(tdSim);
+        tbody.appendChild(tr);
+      });
+    }
+
+    // Slider display
+    const currentRatioSlider = document.getElementById('currentRatioSlider');
+    const opMarginSlider = document.getElementById('opMarginSlider');
+    currentRatioSlider.addEventListener('input', () => {
+      document.getElementById('currentRatioValue').textContent = Number(currentRatioSlider.value).toFixed(2);
+    });
+    opMarginSlider.addEventListener('input', () => {
+      document.getElementById('opMarginValue').textContent = Number(opMarginSlider.value).toFixed(2);
+    });
+
+    // Simulation + recompute everything
+    document.getElementById('simulateBtn').addEventListener('click', () => {
+      const cr = parseFloat(currentRatioSlider.value);
+      const targetOM = parseFloat(opMarginSlider.value);
+
+      // Collect base values across sheets (latest year)
+      const base = collectBaseLatestYear();
+
+      // Apply simulation to sheet cells
+      applySimulationToCells(cr, targetOM, base);
+
+      // Stash simulated key drivers for metrics
+      lastSim = collectSimulatedDrivers();
+
+      // Recompute ratios
+      renderRatios(lastSim);
+
+      // Recompute firm value
+      renderFirmValue(lastSim);
+
+      document.getElementById('simulateStatus').textContent = 'Simulation applied and metrics updated.';
+    });
+
+    // Collect base values from known labels across sheets (latest year)
+    function collectBaseLatestYear() {
+      const getFromSheet = (sheet, label) => {
+        const rows = workbookData[sheet] || [];
+        const hdr = rows[0] || [];
+        const idx = rows.findIndex(r => String(r[0]||'').trim().toLowerCase() === label.toLowerCase());
+        if (idx > 0 && latestYearColIdx != null) return toNum(rows[idx][latestYearColIdx]);
+        return null;
+      };
+      const base = {
+        // Income
+        turnover: getAny(['Incomestatement','income statement'], 'Turnover', getFromSheet),
+        operatingCosts: getAny(['Incomestatement','income statement'], 'Operating costs', getFromSheet),
+        adminExp: getAny(['Incomestatement','income statement'], 'Administrative and general expenses', getFromSheet),
+        otherIncome: getAny(['Incomestatement','income statement'], 'Other income', getFromSheet),
+        financeCosts: getAny(['Incomestatement','income statement'], 'Finance costs', getFromSheet),
+        taxExpense: getAny(['Incomestatement','income statement'], 'Income tax expense', getFromSheet),
+        netIncomeAttrib: getAny(['Incomestatement','income statement'], 'Attributable to Equity holders of the Company', getFromSheet),
+        eps: getAny(['Incomestatement','income statement'], 'Basic earning per share', getFromSheet),
+
+        // Balance
+        cash: getAny(['Balancesheet'], 'Bank balances and cash', getFromSheet),
+        tradeAR: getAny(['Balancesheet'], 'Trade receivables', getFromSheet),
+        inventory: getAny(['Balancesheet'], 'Inventories', getFromSheet),
+        currentLiabilities: getAny(['Firm_Value','Balancesheet'], 'Total Current Liabilities', getFromSheet)
+                           ?? sum([
+                               getAny(['Balancesheet'], 'Trade and bills payables', getFromSheet),
+                               getAny(['Balancesheet'], 'Other payables and accruals', getFromSheet),
+                               getAny(['Balancesheet'], 'Bank borrowings', getFromSheet),
+                               getAny(['Balancesheet'], 'Taxation payable', getFromSheet)
+                             ].map(toNum).filter(v=>v!=null)),
+        bankBorrowingsCurrent: getAny(['Balancesheet'], 'Bank borrowings', getFromSheet),
+        bankBorrowingsNonCurrent: getAny(['Balancesheet'], 'Bank borrowings', getFromSheet), // note: same label may appear in non-current block
+        shareCapital: getAny(['Balancesheet'], 'Share capital', getFromSheet),
+        otherReserves: getAny(['Balancesheet'], 'Other reserves', getFromSheet),
+        retainedEarnings: getAny(['Balancesheet'], 'Retained earnings', getFromSheet),
+        minorityInterest: getAny(['Balancesheet'], 'Minority interest', getFromSheet),
+
+        // Cashflow
+        cfo: getAny(['Firm_Value','Cashflow'], 'CFO', getFromSheet) ?? getAny(['Cashflow'], 'Net cash generated from operating activities', getFromSheet),
+        capex: getAny(['Cashflow'], 'Purchase of fixed assets', getFromSheet),
+        ppeProceeds: getAny(['Cashflow'], 'Proceeds from disposal of fixed assets', getFromSheet),
+
+        // Firm_Value sheet for market/params
+        longTermDebtFV: getAny(['Firm_Value'], 'Long term debt', getFromSheet),
+        interestExpenseFV: getAny(['Firm_Value'], 'Interest Expense', getFromSheet),
+        peIndexPct: getAny(['Firm_Value'], 'PE ratio ( percentage ) of Hang Seng Index', getFromSheet),
+        dividendPerShare: getAny(['Firm_Value'], 'Dividend', getFromSheet),
+        epsFV: getAny(['Firm_Value'], 'EPS', getFromSheet),
+        roeFV: getAny(['Firm_Value'], 'ROE', getFromSheet),
+        betaFV: getAny(['Firm_Value'], 'Beta', getFromSheet),
+        rfFV: getAny(['Firm_Value'], 'Risk-Free Rate', getFromSheet),
+        priceFV: getAny(['Firm_Value'], 'Price ( year ended? )', getFromSheet),
+        kdNotes: getAny(['Firm_Value'], 'Cost of debt from notes to account', getFromSheet),
+        profitAttribFV: getAny(['Firm_Value'], 'Profit attributable to shareholder', getFromSheet),
+        pretaxIncomeFV: getAny(['Firm_Value'], 'Pretax Income', getFromSheet),
+      };
+      // Book equity
+      base.bookEquity = sum([base.shareCapital, base.otherReserves, base.retainedEarnings, base.minorityInterest].filter(v=>v!=null));
+      // Shares
+      const profit = base.profitAttribFV ?? base.netIncomeAttrib;
+      const eps = base.epsFV ?? base.eps;
+      base.shares = (profit != null && eps != null && eps !== 0) ? profit / eps : null;
+      // Market equity
+      base.mvEquity = (base.priceFV != null && base.shares != null) ? base.priceFV * base.shares : null;
+      // Total debt
+      base.totalDebt = sum([base.longTermDebtFV, base.bankBorrowingsCurrent].filter(v=>v!=null)) ?? base.currentLiabilities ?? null;
+      // Tax rate
+      base.taxRate = safeDiv(base.taxExpense, base.pretaxIncomeFV);
+      return base;
+    }
+
+    function getAny(sheets, label, getter) {
+      for (const s of sheets) {
+        const v = getter(s, label);
+        if (v != null) return v;
+      }
+      return null;
+    }
+
+    // Apply simulation to visible cells
+    function applySimulationToCells(cr, targetOM, base) {
+      // First pass: update current liabilities by current ratio
+      document.querySelectorAll('.sim-cell').forEach(td => {
+        const label = String(td.dataset.label || '').toLowerCase();
+        const val = toNum(td.dataset.base);
+        let sim = val;
+
+        if (val != null) {
+          // current liabilities adjustment
+          if (label.includes('total current liabilities') || label === 'current liabilities' || label.includes('taxation payable') || label.includes('bank borrowings')) {
+            // For the aggregate "Total Current Liabilities", scale by (1/cr) from base
+            if (label.includes('total current liabilities')) {
+              sim = val / cr;
+            }
+            // For "Bank borrowings" (current), leave as base; the aggregate will be used for debt weight
+          }
+        }
+        td.textContent = sim != null ? String(sim) : td.dataset.base;
+      });
+
+      // Second pass: back-solve operating costs to hit target operating margin: OM = (Turnover - Operating costs)/Turnover
+      // Find turnover base (latest year) from Income statement
+      const turnCell = Array.from(document.querySelectorAll('.sim-cell')).find(td => String(td.dataset.label).toLowerCase() === 'turnover');
+      const turnoverSim = turnCell ? toNum(turnCell.textContent) ?? toNum(turnCell.dataset.base) : base.turnover;
+      if (turnoverSim != null && turnoverSim !== 0) {
+        const desiredOpProfit = turnoverSim * targetOM;
+        const desiredOpCosts = turnoverSim - desiredOpProfit;
+        // Update all rows labeled "Operating costs"
+        document.querySelectorAll('.sim-cell').forEach(td => {
+          const label = String(td.dataset.label || '').toLowerCase();
+          if (label === 'operating costs') {
+            td.textContent = desiredOpCosts.toFixed(2);
+          }
+        });
+      }
+    }
+
+    // Collect simulated drivers across sheets after applying simulation
+    function collectSimulatedDrivers() {
+      const getSim = (labelExact) => {
+        const td = Array.from(document.querySelectorAll('.sim-cell')).find(c => String(c.dataset.label||'').trim().toLowerCase() === labelExact.toLowerCase());
+        if (!td) return null;
+        return toNum(td.textContent) ?? toNum(td.dataset.base);
+      };
+      const sim = {
+        turnover: getSim('Turnover'),
+        operatingCosts: getSim('Operating costs'),
+        currentLiabilities: getSim('Total Current Liabilities')
+      };
+      // Keep other base-derived needed values from last collection if present in DOM
+      // Pull from previous base stored during simulation run (recompute base again to be safe)
+      const base = collectBaseLatestYear();
+      // Debt: update using simulated current liabilities if it exists; otherwise fallback to base
+      sim.totalDebt = sim.currentLiabilities ?? base.totalDebt;
+      // Market equity and shares stay from base unless sheet includes price for latest year
+      sim.shares = base.shares;
+      sim.mvEquity = base.mvEquity;
+      sim.rf = base.rfFV;
+      sim.beta = base.betaFV;
+      // Market return heuristic from index "PE ratio (percentage)" as earnings yield add-on
+      sim.rm = (base.rfFV != null && base.peIndexPct != null) ? (base.rfFV + base.peIndexPct) : null;
+      // Cost of debt: prefer notes else interest / avgDebt (use current debt)
+      sim.kd = base.kdNotes ?? safeDiv(base.interestExpenseFV, base.totalDebt);
+      sim.taxRate = base.taxRate;
+      // CFO/Capex for FCFF
+      sim.cfo = base.cfo;
+      sim.capex = base.capex;
+      sim.ppeProceeds = base.ppeProceeds;
+      // Growth from ROE and payout (dividend per share / EPS)
+      const payout = (base.dividendPerShare != null && (base.epsFV ?? base.eps) != null && (base.epsFV ?? base.eps) !== 0)
+                   ? (base.dividendPerShare / (base.epsFV ?? base.eps)) : null;
+      sim.roe = base.roeFV;
+      sim.growth = (sim.roe != null && payout != null) ? (sim.roe * (1 - payout)) : null;
+
+      // Cost of equity via CAPM
+      sim.ke = (sim.rf != null && sim.beta != null && sim.rm != null) ? (sim.rf + sim.beta * (sim.rm - sim.rf)) : null;
+
+      // Weights
+      const totalCap = sum([sim.mvEquity, sim.totalDebt].filter(v=>v!=null));
+      sim.we = safeDiv(sim.mvEquity, totalCap);
+      sim.wd = safeDiv(sim.totalDebt, totalCap);
+
+      // WACC
+      sim.wacc = (sim.we != null && sim.ke != null && sim.wd != null && sim.kd != null && sim.taxRate != null)
+               ? (sim.we*sim.ke + sim.wd*sim.kd*(1 - sim.taxRate))
+               : null;
+
+      // FCFF (CFO-based)
+      sim.fcff = (sim.cfo != null && sim.capex != null)
+               ? (sim.cfo - (sim.capex - (sim.ppeProceeds ?? 0)))
+               : (sim.turnover != null && sim.operatingCosts != null)
+                 ? (sim.turnover - sim.operatingCosts) // illustrative fallback
+                 : null;
+
+      // Net borrowing (not available single-year; treat as 0 for simulation unless debt change data present)
+      const netBorrowing = 0;
+
+      // FCFE
+      sim.fcfe = (sim.fcff != null) ? (sim.fcff - netBorrowing) : null;
+
+      // Firm value via Gordon for FCFF and FCFE
+      sim.firmValueFCFF = (sim.fcff != null && sim.wacc != null && sim.growth != null && sim.wacc > sim.growth)
+                        ? (sim.fcff * (1 + sim.growth) / (sim.wacc - sim.growth))
+                        : null;
+      sim.firmValueFCFE = (sim.fcfe != null && sim.ke != null && sim.growth != null && sim.ke > sim.growth)
+                        ? (sim.fcfe * (1 + sim.growth) / (sim.ke - sim.growth))
+                        : null;
+
+      // Implied per-share from firm value
+      sim.epsFromFCFF = (sim.firmValueFCFF != null && sim.shares != null && sim.shares !== 0) ? (sim.firmValueFCFF / sim.shares) : null;
+      sim.epsFromFCFE = (sim.firmValueFCFE != null && sim.shares != null && sim.shares !== 0) ? (sim.firmValueFCFE / sim.shares) : null;
+
+      // Ratios
+      sim.currentAssets = sum([
+        getCell('Balancesheet', 'Inventories'),
+        getCell('Balancesheet', 'Trade receivables'),
+        getCell('Balancesheet', 'Deposits, prepayments and other receivables'),
+        getCell('Balancesheet', 'Amounts due from related companies'),
+        getCell('Balancesheet', 'Amounts due from associated companies and jointly controlled entities'),
+        getCell('Balancesheet', 'Bank balances and cash')
+      ].map(toNum).filter(v=>v!=null));
+      sim.cash = getCell('Balancesheet','Bank balances and cash');
+
+      return sim;
+    }
+
+    function getCell(sheet, label) {
+      const rows = workbookData[sheet] || [];
+      const idx = rows.findIndex(r => String(r[0]||'').trim().toLowerCase() === label.toLowerCase());
+      if (idx <= 0) return null;
+      const yIdx = latestYearColIdx ?? 1;
+      return toNum(rows[idx][yIdx]);
+    }
+
+    // Render ratios
+    function renderRatios(sim) {
+      const tbody = document.querySelector('#ratiosTable tbody');
+      tbody.innerHTML = '';
+
+      const ratios = [];
+      // Current ratio = Current Assets / Current Liabilities (simulated CL)
+      const currentRatio = safeDiv(sim.currentAssets, sim.currentLiabilities);
+      ratios.push(['Current ratio', fmt(currentRatio)]);
+      // Cash ratio = Cash / Current Liabilities
+      const cashRatio = safeDiv(sim.cash, sim.currentLiabilities);
+      ratios.push(['Cash ratio', fmt(cashRatio)]);
+      // Operating margin = (Turnover - Operating costs)/Turnover (simulated OC via slider)
+      const opMargin = (sim.turnover != null && sim.operatingCosts != null && sim.turnover !== 0)
+                     ? ((sim.turnover - sim.operatingCosts)/sim.turnover) : null;
+      ratios.push(['Operating margin', fmt(opMargin)]);
+      // Debt to equity = Total Debt / Book Equity
+      const bookEquity = collectBaseLatestYear().bookEquity;
+      const debtToEquity = safeDiv(sim.totalDebt, bookEquity);
+      ratios.push(['Debt to equity', fmt(debtToEquity)]);
+      // CFO to debt
+      const cfoToDebt = safeDiv(sim.cfo, sim.totalDebt);
+      ratios.push(['CFO to debt', fmt(cfoToDebt)]);
+      // Times interest earned = EBIT / Interest (approx EBIT = Turnover - Operating costs)
+      const ebit = (sim.turnover != null && sim.operatingCosts != null) ? (sim.turnover - sim.operatingCosts) : null;
+      const interest = collectBaseLatestYear().interestExpenseFV ?? collectBaseLatestYear().financeCosts;
+      const tie = safeDiv(ebit, interest);
+      ratios.push(['Times interest earned', fmt(tie)]);
+
+      ratios.forEach(([label,val]) => {
+        const tr = document.createElement('tr');
+        const td1 = document.createElement('td'); td1.textContent = label;
+        const td2 = document.createElement('td'); td2.textContent = val;
+        tr.appendChild(td1); tr.appendChild(td2); tbody.appendChild(tr);
+      });
+    }
+
+    // Render firm value metrics
+    function renderFirmValue(sim) {
+      const tbody = document.querySelector('#firmValueTable tbody');
+      tbody.innerHTML = '';
+      const rows = [
+        ['Market value of equity (Price×Shares)', fmt(sim.mvEquity)],
+        ['Total debt (simulated)', fmt(sim.totalDebt)],
+        ['Weights: We', fmt(sim.we)],
+        ['Weights: Wd', fmt(sim.wd)],
+        ['Cost of equity (CAPM)', fmt(sim.ke)],
+        ['Cost of debt (pre-tax)', fmt(sim.kd)],
+        ['Tax rate', fmt(sim.taxRate)],
+        ['WACC', fmt(sim.wacc)],
+        ['FCFF (CFO-based)', fmt(sim.fcff)],
+        ['FCFE', fmt(sim.fcfe)],
+        ['Growth (ROE·(1−payout))', fmt(sim.growth)],
+        ['Firm value using FCFF', fmt(sim.firmValueFCFF)],
+        ['Firm value using FCFE', fmt(sim.firmValueFCFE)],
+        ['Implied EPS from FCFF', fmt(sim.epsFromFCFF)],
+        ['Implied EPS from FCFE', fmt(sim.epsFromFCFE)]
+      ];
+      rows.forEach(([label,val]) => {
+        const tr = document.createElement('tr');
+        const td1 = document.createElement('td'); td1.textContent = label;
+        const td2 = document.createElement('td'); td2.textContent = val;
+        tr.appendChild(td1); tr.appendChild(td2); tbody.appendChild(tr);
+      });
+    }
+
+    function fmt(v) {
+      if (v == null || Number.isNaN(v)) return 'N/A';
+      return new Intl.NumberFormat('en-US', { maximumFractionDigits: 4 }).format(v);
+    }
+  </script>
+</body>
+</html>
